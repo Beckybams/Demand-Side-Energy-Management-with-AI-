@@ -1,0 +1,102 @@
+"""
+Demand-Side-Energy-Management-with-AI.py
+
+Single-file demo project that:
+1. Generates synthetic demand-side energy data for multiple buildings.
+2. Trains a machine learning model (RandomForest) to forecast short-term demand.
+3. Runs a simple scheduling optimizer for controllable loads to minimize cost under time-of-use pricing.
+4. Evaluates performance and plots results.
+
+Dependencies:
+- numpy
+- pandas
+- scikit-learn
+- matplotlib
+- pulp (optional, for exact optimization) -- if not available the script uses a heuristic scheduler
+
+Run:
+python Demand-Side-Energy-Management-with-AI.py
+
+This file is self-contained and uses synthetic data (no external files required).
+"""
+
+import math
+import os
+import random
+from datetime import datetime, timedelta
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.model_selection import train_test_split
+
+# Try to import pulp for linear optimization; fall back to heuristic if unavailable
+try:
+    import pulp
+    PULP_AVAILABLE = True
+except Exception:
+    PULP_AVAILABLE = False
+
+
+# -------------------------
+# 1) Synthetic data engine
+# -------------------------
+
+def generate_synthetic_data(
+    n_buildings=5,
+    start_date="2025-01-01",
+    days=30,
+    timestep_minutes=60,
+    seed=42,
+):
+    """Generates synthetic demand-side data for n_buildings over a number of days.
+
+    Columns per timestamp per building:
+      - timestamp
+      - building_id
+      - outdoor_temp (deg C)
+      - occupancy (0..1 continuous)
+      - solar_gen (kW)
+      - base_load (kW)  # inflexible
+      - ac_load (kW)    # thermostatically controlled, partially flexible
+      - ev_load (kW)    # EV charging flexible
+      - controllable_total (kW) = ac_load + ev_load
+      - total_load (kW) = base_load + controllable_total - solar_gen
+      - price ($/kWh)   # time-of-use price
+
+    Returns a pandas DataFrame.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+
+    start = datetime.fromisoformat(start_date)
+    periods = int(24 * 60 / timestep_minutes * days)
+    freq = f"{timestep_minutes}T"
+
+    timestamps = pd.date_range(start, periods=periods, freq=freq)
+
+    rows = []
+    for b in range(n_buildings):
+        # building-specific parameters
+        base_mean = random.uniform(0.4, 1.5)  # kW
+        ac_capacity = random.uniform(0.5, 3.0)
+        ev_max = random.choice([0.0, 3.3, 6.6])  # some buildings have EVs
+        solar_capacity = random.choice([0.0, 1.5, 3.0])
+
+        for t in timestamps:
+            # hour of day effects
+            hour = t.hour + t.minute / 60.0
+            # outdoor temp follows a simple sinusoidal daily pattern + small noise
+            day_of_year = t.timetuple().tm_yday
+            seasonal = 10 * math.sin(2 * math.pi * (day_of_year / 365.0 - 0.25))
+            daily_temp = 8 * math.sin(2 * math.pi * (hour / 24.0 - 0.25))
+            outdoor_temp = 20 + seasonal + daily_temp + np.random.normal(0, 1.2)
+
+            # occupancy: high during day, low at night, with weekday/weekend variation
+            weekday = t.weekday() < 5
+            occ_peak = 0.7 if weekday else 0.4
+            occupancy = max(0.05, np.random.normal(0.1 + occ_peak * (math.exp(-0.5 * ((hour - 14) / 3) ** 2)), 0.05))
+
+            # solar generation roughly bell-shaped around midday
